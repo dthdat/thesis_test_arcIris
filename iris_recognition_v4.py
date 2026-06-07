@@ -1,12 +1,13 @@
 # %% [markdown]
-# # Iris Recognition — ResNet18 + ArcFace (Production Refactor v4)
+# # Iris Recognition — IrisIResNet50_MSFF + ArcFace (Production Refactor v4)
 #
 # **Key changes over v3:**
 # 1. Daugman Rubber Sheet Model replaces naive resize — only pure iris tissue is fed to the network
 # 2. Input geometry changed from 224×224 to 64×512 (polar iris strip)
 # 3. HoughCircles-based pupil/iris boundary localization
-# 4. Attention penalty adapted for rectangular feature maps
-# 5. All other fixes from v3 retained (subject-exclusive split, ArcFace margin, etc.)
+# 4. Backbone upgraded to IResNet50 with stride-1 first conv to preserve 64x512 resolution
+# 5. Added Multi-Scale Feature Fusion (MSFF) combining Layer 3 and Layer 4 features
+# 6. All other fixes from v3 retained (subject-exclusive split, ArcFace margin, etc.)
 
 # %% — Cell 1: Install dependencies
 import subprocess, sys
@@ -75,7 +76,7 @@ CONFIG = {
     "lr":              1e-3,
     "train_pool_frac": 0.80,
     "val_img_frac":    0.10,
-    "patience":        10,
+    "patience":        25,
     "min_samples":     3,
     "norm_mean":       0.449,
     "norm_std":        0.226,
@@ -429,70 +430,140 @@ test_loader  = DataLoader(test_ds,  batch_size=CONFIG["batch_size"], shuffle=Fal
 print("DataLoaders ready")
 
 # %% [markdown]
-# ## Model: IrisResNet18 + ArcFace
+# ## Model: IrisIResNet50_MSFF + ArcFace
 #
-# ResNet18 adapted for 1-channel 64×512 polar iris input.
-# The adaptive average pooling handles the non-square geometry naturally.
+# IResNet50 customized for 1-channel 64×512 polar iris input with MSFF.
+# No maxpool, stride-1 conv1 preserves spatial resolution.
 # Feature map sizes through the network:
-# - conv1 (stride 2): 32×256
-# - maxpool (stride 2): 16×128
-# - layer1: 16×128, layer2: 8×64, layer3: 4×32, layer4: 2×16
+# - conv1 (stride 1): 64×512
+# - layer1 (stride 2): 32×256, layer2 (stride 2): 16×128
+# - layer3 (stride 2): 8×64 (256ch), layer4 (stride 2): 4×32 (512ch)
+# - MSFF fuses L3↓(256ch) + L4(512ch) = 768ch × 4×32 = 98,304 → FC → 512
 
 # %% — Cell 9: Model Architecture
-class IrisResNet(nn.Module):
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+class IBasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None,
+                 groups=1, base_width=64, dilation=1):
+        super(IBasicBlock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(inplanes, eps=1e-05)
+        self.conv1 = conv3x3(inplanes, planes)
+        self.bn2 = nn.BatchNorm2d(planes, eps=1e-05)
+        self.prelu = nn.PReLU(planes)
+        self.conv2 = conv3x3(planes, planes, stride)
+        self.bn3 = nn.BatchNorm2d(planes, eps=1e-05)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        out = self.bn1(x)
+        out = self.conv1(out)
+        out = self.bn2(out)
+        out = self.prelu(out)
+        out = self.conv2(out)
+        out = self.bn3(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        return out
+
+class IrisIResNet50_MSFF(nn.Module):
     """
-    ResNet18 for 1-channel polar iris images (64×512).
-    Returns (embedding, layer3_spatial, layer4_spatial).
+    IResNet50 backbone customized for 1-channel polar iris strips (64x512)
+    with Multi-Scale Feature Fusion (MSFF) combining Layer3 and Layer4.
     """
-    def __init__(self, pretrained=True, freeze_backbone=False):
+    fc_scale = 4 * 32
+    def __init__(self, num_features=512):
         super().__init__()
-        weights  = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        backbone = models.resnet18(weights=weights)
+        self.inplanes = 64
+        self.dilation = 1
+        self.groups = 1
+        self.base_width = 64
+        block = IBasicBlock
+        layers = [3, 4, 14, 3]  # IResNet50 layers
 
-        # 1-channel conv1: average across RGB dim of pretrained weights
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        if pretrained:
-            with torch.no_grad():
-                self.conv1.weight.copy_(backbone.conv1.weight.mean(dim=1, keepdim=True))
-
-        self.bn1     = backbone.bn1
-        self.relu    = backbone.relu
-        self.maxpool = backbone.maxpool
-        self.layer1  = backbone.layer1
-        self.layer2  = backbone.layer2
-        self.layer3  = backbone.layer3   # 256 ch, 4×32 for 64×512 input
-        self.layer4  = backbone.layer4   # 512 ch, 2×16 for 64×512 input
-        self.avgpool = backbone.avgpool
+        # 1-channel conv1 for grayscale iris strips
+        self.conv1 = nn.Conv2d(1, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.inplanes, eps=1e-05)
+        self.prelu = nn.PReLU(self.inplanes)
         
-        # Bottleneck Injection
+        self.layer1 = self._make_layer(block, 64, layers[0], stride=2)
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        
+        self.bn2 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05)
+        
+        # Multi-Scale Feature Fusion (MSFF) blocks
+        # Downsample Layer3 (256x8x64) -> (256x4x32) to match Layer4
+        self.fusion_conv = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1, bias=False)
+        self.fusion_bn = nn.BatchNorm2d(256, eps=1e-05)
+        self.fusion_prelu = nn.PReLU(256)
+        
+        # Fused channels: 256 (from L3) + 512 (from L4) = 768
         self.dropout = nn.Dropout(p=CONFIG["dropout_rate"])
-        self.bottleneck = nn.Linear(512, 512, bias=False)
-        self.bn2 = nn.BatchNorm1d(512)
+        self.fc = nn.Linear(768 * block.expansion * self.fc_scale, num_features)
         
-        self.embedding_dim = 512
+        self.features = nn.BatchNorm1d(num_features, eps=1e-05)
+        nn.init.constant_(self.features.weight, 1.0)
+        self.features.weight.requires_grad = False
 
-        if freeze_backbone:
-            for m in [self.conv1, self.bn1, self.layer1, self.layer2]:
-                for p in m.parameters():
-                    p.requires_grad = False
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0, 0.1)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                nn.BatchNorm2d(planes * block.expansion, eps=1e-05),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, self.groups, self.base_width, self.dilation))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, groups=self.groups, base_width=self.base_width, dilation=self.dilation))
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
+        x = self.prelu(x)
+        
         x = self.layer1(x)
         x = self.layer2(x)
-        x = self.layer3(x)
-        l3_feat = x
-        x = self.layer4(x)
-        l4_feat = x
-        x = self.avgpool(x)
-        x = x.flatten(1)
         
-        x = self.dropout(x)
-        x = self.bottleneck(x)
-        x = self.bn2(x)
+        l3_feat = self.layer3(x)  # 256 x 8 x 64
+        
+        l4_feat = self.layer4(l3_feat)  # 512 x 4 x 32
+        x = self.bn2(l4_feat)
+        
+        # MSFF: process l3_feat to match l4_feat spatial dimensions
+        l3_down = self.fusion_conv(l3_feat)
+        l3_down = self.fusion_bn(l3_down)
+        l3_down = self.fusion_prelu(l3_down)  # 256 x 4 x 32
+        
+        # Concatenate along channel dim: (256 + 512 = 768) x 4 x 32
+        fused = torch.cat((l3_down, x), dim=1)
+        fused = torch.flatten(fused, 1)
+        
+        fused = self.dropout(fused)
+        x = self.fc(fused)
+        x = self.features(x)
         
         embeds = F.normalize(x, p=2, dim=1)
         return embeds, l3_feat, l4_feat
@@ -526,7 +597,7 @@ class ArcFaceHead(nn.Module):
         return F.linear(embeddings, W)
 
 
-model       = IrisResNet(pretrained=True).to(DEVICE)
+model       = IrisIResNet50_MSFF().to(DEVICE)
 arcface     = ArcFaceHead(512, NUM_CLASSES,
                           s=CONFIG["arcface_s"], m=CONFIG["arcface_m"]).to(DEVICE)
 base_model  = model
@@ -537,25 +608,26 @@ if torch.cuda.device_count() > 1:
 
 n_backbone = sum(p.numel() for p in base_model.parameters())
 n_head     = sum(p.numel() for p in arcface.parameters())
-print(f"IrisResNet18: {n_backbone:,} params")
+print(f"IrisIResNet50_MSFF: {n_backbone:,} params")
 print(f"ArcFace head: {n_head:,} params  (s={arcface.s}, m={arcface.m}, classes={NUM_CLASSES})")
 
 # Verify feature map sizes
 with torch.no_grad():
-    _dummy = torch.randn(1, 1, CONFIG["polar_height"], CONFIG["polar_width"]).to(DEVICE)
+    _dummy = torch.randn(2, 1, CONFIG["polar_height"], CONFIG["polar_width"]).to(DEVICE)
     _, _l3, _l4 = base_model(_dummy)
     print(f"Layer3 feature map: {_l3.shape}")
     print(f"Layer4 feature map: {_l4.shape}")
 
 # %% [markdown]
-# ## Attention Penalty (Spatial Regularization)
+# ## Attention Penalty (Removed)
 #
-# Adapted for the rectangular layer3 feature map (4×32 for 64×512 input).
-# Uses separate sigma values for height and width dimensions.
-
-# %% — Cell 10: Attention Penalty (Removed)
 # Spatial regularization is no longer needed since Daugman Rubber Sheet model
 # fundamentally isolates the pure iris tissue, removing the background.
+# Additionally, MSFF (Multi-Scale Feature Fusion) now handles multi-scale features
+# much better than attention over single-layer spatial maps.
+
+# %% — Cell 10: Attention Penalty (Removed)
+# (Attention logic removed in v4 to accommodate MSFF)
 
 # %% [markdown]
 # ## Training Loop
@@ -563,10 +635,10 @@ with torch.no_grad():
 # %% — Cell 11: Training Loop
 criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-# Initial Freeze: freeze all except bottleneck, bn2, and arcface head
+# Initial Freeze: freeze all except fc, features, MSFF layers, and arcface head
 print("Freezing backbone for 5-epoch warmup...")
 for name, param in base_model.named_parameters():
-    if "bottleneck" not in name and "bn2" not in name:
+    if not any(x in name for x in ["fc", "features", "fusion_conv", "fusion_bn", "fusion_prelu"]):
         param.requires_grad = False
 
 optimizer = optim.AdamW(
@@ -574,8 +646,11 @@ optimizer = optim.AdamW(
      {"params": arcface.parameters()}],
     lr=CONFIG["lr"], weight_decay=1e-2
 )
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
-
+scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, 
+    T_max=CONFIG['epochs'] - 5, # Total epochs minus warmup epochs
+    eta_min=1e-6
+)
 history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 best_val_loss = float("inf")
 patience_ctr  = 0
@@ -586,6 +661,8 @@ for epoch in range(CONFIG["epochs"]):
         print("Unfreezing backbone for end-to-end fine-tuning...")
         for param in base_model.parameters():
             param.requires_grad = True
+        # Re-freeze features.weight — must stay at 1.0 for proper cosine margin
+        base_model.features.weight.requires_grad = False
         # PyTorch optimizer automatically tracks these parameters since they 
         # were passed during initialization. Gradients will now flow.
     # ── Train ──
@@ -622,8 +699,15 @@ for epoch in range(CONFIG["epochs"]):
         for imgs, lbls in val_loader:
             imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
             embeds, _, _ = model(imgs)
+            
+            # Extract raw cosine similarities [-1, 1]
             cosine = arcface.get_cosine(embeds)
-            loss   = criterion(cosine, lbls)
+            
+            # FIX: Scale the cosines by the ArcFace 's' attribute (64.0) 
+            # to compute a mathematically valid Cross-Entropy loss landscape
+            scaled_logits = cosine * arcface.s 
+            loss = criterion(scaled_logits, lbls)
+            
             vl_loss    += loss.item() * imgs.size(0)
             vl_correct += (cosine.argmax(1) == lbls).sum().item()
             vl_total   += lbls.size(0)
@@ -840,10 +924,43 @@ wrapped = GradCAMWrapper(base_model, arcface).eval()
 target_layer = base_model.layer3[-1]
 cam = GradCAMPlusPlus(model=wrapped, target_layers=[target_layer])
 
+def map_polar_to_cartesian(heatmap_color, orig_shape, pupil_xyr, iris_xyr):
+    h, w = orig_shape
+    px, py, pr = pupil_xyr
+    ix, iy, ir = iris_xyr
+    polar_h, polar_w = heatmap_color.shape[:2]
+    
+    theta = np.linspace(0, 2 * pi, polar_w + 1)[:-1]
+    px_circle = px + pr * np.cos(theta)
+    py_circle = py + pr * np.sin(theta)
+    ix_circle = ix + ir * np.cos(theta)
+    iy_circle = iy + ir * np.sin(theta)
+    
+    radius = np.linspace(1 / polar_h, 1.0, polar_h)[:, np.newaxis]
+    
+    x_coords = (1 - radius) * px_circle + radius * ix_circle
+    y_coords = (1 - radius) * py_circle + radius * iy_circle
+    
+    cartesian = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    for r_idx in range(polar_h - 1):
+        for t_idx in range(polar_w):
+            t_next = (t_idx + 1) % polar_w
+            pts = np.array([
+                [x_coords[r_idx, t_idx], y_coords[r_idx, t_idx]],
+                [x_coords[r_idx, t_next], y_coords[r_idx, t_next]],
+                [x_coords[r_idx+1, t_next], y_coords[r_idx+1, t_next]],
+                [x_coords[r_idx+1, t_idx], y_coords[r_idx+1, t_idx]]
+            ], np.int32)
+            color = heatmap_color[r_idx, t_idx].tolist()
+            cv2.fillConvexPoly(cartesian, pts, color)
+            
+    return cartesian
+
 N_VIS = min(6, len(val_ds))
-fig, axes = plt.subplots(3, N_VIS, figsize=(3 * N_VIS, 9))
+fig, axes = plt.subplots(4, N_VIS, figsize=(3 * N_VIS, 12))
 if N_VIS == 1:
-    axes = axes.reshape(3, 1)
+    axes = axes.reshape(4, 1)
 
 for i in range(N_VIS):
     t, lbl = val_ds[i]
@@ -866,6 +983,19 @@ for i in range(N_VIS):
     heatmap_resized = cv2.resize(heatmap_color, (CONFIG["polar_width"], CONFIG["polar_height"]))
     orig_3ch = cv2.cvtColor(orig_disp, cv2.COLOR_GRAY2RGB)
     overlay = cv2.addWeighted(orig_3ch, 0.5, heatmap_resized, 0.5, 0)
+    
+    # Original Cartesian Image mapping
+    orig_path = val_paths[i]
+    orig_img = cv2.imread(orig_path, cv2.IMREAD_GRAYSCALE)
+    pupil = find_pupil_circle(orig_img)
+    iris = find_iris_circle(orig_img, pupil)
+    
+    orig_img_3ch = cv2.cvtColor(orig_img, cv2.COLOR_GRAY2RGB)
+    if pupil is not None and iris is not None:
+        cart_heatmap = map_polar_to_cartesian(heatmap_resized, orig_img.shape, pupil, iris)
+        cart_overlay = cv2.addWeighted(orig_img_3ch, 0.6, cart_heatmap, 0.4, 0)
+    else:
+        cart_overlay = orig_img_3ch
 
     axes[0, i].imshow(orig_disp, cmap="gray", aspect="auto")
     axes[0, i].set_title(f"Polar Strip (lbl={lbl})", fontsize=8); axes[0, i].axis("off")
@@ -874,9 +1004,12 @@ for i in range(N_VIS):
     axes[1, i].set_title("GradCAM++", fontsize=8); axes[1, i].axis("off")
 
     axes[2, i].imshow(overlay, aspect="auto")
-    axes[2, i].set_title("Overlay", fontsize=8); axes[2, i].axis("off")
+    axes[2, i].set_title("Polar Overlay", fontsize=8); axes[2, i].axis("off")
+    
+    axes[3, i].imshow(cart_overlay)
+    axes[3, i].set_title("Cartesian Overlay", fontsize=8); axes[3, i].axis("off")
 
-plt.suptitle(f"GradCAM++ — Layer3 targeting cosine class logits (polar {CONFIG['polar_height']}×{CONFIG['polar_width']})", fontsize=12)
+plt.suptitle(f"GradCAM++ — Layer3 targeting cosine class logits", fontsize=12)
 plt.tight_layout()
 plt.savefig(os.path.join(CONFIG["save_dir"], "gradcam.png"), dpi=150)
 plt.show()
@@ -897,7 +1030,7 @@ class ONNXWrapper(nn.Module):
 
 export_model = ONNXWrapper(base_model).eval()
 dummy        = torch.randn(1, 1, CONFIG["polar_height"], CONFIG["polar_width"]).to(DEVICE)
-onnx_path    = os.path.join(CONFIG["save_dir"], "iris_resnet18_v4.onnx")
+onnx_path    = os.path.join(CONFIG["save_dir"], "iris_iresnet50_msff.onnx")
 
 torch.onnx.export(
     export_model,
@@ -1009,15 +1142,16 @@ run_test("T9:  EER in sane range (<50%)",                  test_eer_sane)
 #
 # Artifacts saved to `CONFIG['save_dir']`:
 # - `best_model.pth` — PyTorch checkpoint
-# - `iris_resnet18_v4.onnx` — ONNX model (dynamic batch, opset 17)
+# - `iris_iresnet50_msff.onnx` — ONNX model (dynamic batch, opset 17)
 # - `training_curves.png`, `openset_evaluation.png`, `tsne.png`, `gradcam.png`
 #
 # **Next step (Jetson Nano):**
 # ```bash
-# trtexec --onnx=iris_resnet18_v4.onnx \
-#         --saveEngine=iris_resnet18.trt \
+# trtexec --onnx=iris_iresnet50_msff.onnx \
+#         --saveEngine=iris_iresnet50_msff.trt \
 #         --fp16 \
 #         --minShapes=iris_polar:1x1x64x512 \
 #         --optShapes=iris_polar:1x1x64x512 \
 #         --maxShapes=iris_polar:4x1x64x512
 # ```
+
