@@ -80,7 +80,8 @@ CONFIG = {
     "norm_mean":       0.449,
     "norm_std":        0.226,
     "arcface_s":       64.0,
-    "arcface_m":       0.40,
+    "arcface_m":       0.25,
+    "dropout_rate":    0.5,
     "attn_weight":     2.0,
 }
 os.makedirs(CONFIG["save_dir"], exist_ok=True)
@@ -99,71 +100,64 @@ print(f"Save dir: {CONFIG['save_dir']}")
 
 # %% — Cell 4: Daugman Rubber Sheet Preprocessing
 def find_pupil_circle(gray):
-    """Detect the pupillary boundary using HoughCircles."""
-    h, w = gray.shape
-    min_dim = min(h, w)
+    """Detect the pupillary boundary using HoughCircles calibrated for CASIA-Thousand."""
+    # Ensure parameter stabilization with subtle bilateral smoothing
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # Blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    # Adaptive threshold to enhance dark pupil region
+    # Adaptive threshold to isolate dark pupil region
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    # HoughCircles on the thresholded image
+    # HoughCircles parameters loosened to capture CASIA properties
     circles = cv2.HoughCircles(
         thresh,
         cv2.HOUGH_GRADIENT,
         dp=1,
-        minDist=min_dim // 4,
+        minDist=100,
         param1=100,
-        param2=30,
-        minRadius=max(10, min_dim // 20),
-        maxRadius=min_dim // 4,
+        param2=12,   # Lower accumulator threshold makes it more sensitive
+        minRadius=15,  # Matches the minimum 16px physiological limit
+        maxRadius=80,  # Matches the maximum 70px pupil dilation profile
     )
     if circles is None:
         return None
 
-    # Pick the circle closest to the image center
-    circles = circles[0]
-    cx_img, cy_img = w / 2, h / 2
-    best = min(circles, key=lambda c: (c[0] - cx_img)**2 + (c[1] - cy_img)**2)
-    return best  # (x, y, r)
+    # Pick the most prominent circle found by the Hough Accumulator
+    # Instead of forcing center-proximity, trust the strongest mathematical edge accumulation
+    return circles[0][0]  # (x, y, r)
 
 
 def find_iris_circle(gray, pupil_xyr):
-    """Detect the limbus (iris outer) boundary, constrained by the pupil."""
+    """Detect the limbus boundary relative to localized pupil constraints."""
     if pupil_xyr is None:
         return None
 
-    h, w = gray.shape
-    min_dim = min(h, w)
     px, py, pr = pupil_xyr
-
-    # Use Canny edges for the iris boundary
-    edges = cv2.Canny(gray, 30, 100)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blurred, 20, 70) # Lowered thresholds to isolate subtle sclera contrast
 
     circles = cv2.HoughCircles(
         edges,
         cv2.HOUGH_GRADIENT,
         dp=1,
-        minDist=min_dim // 3,
+        minDist=100,
         param1=50,
-        param2=30,
-        minRadius=int(pr * 1.5),
-        maxRadius=min(int(min_dim * 0.45), w // 2),
+        param2=15,    # Sensitive collection threshold
+        minRadius=int(pr + 25), # Physically forces the iris boundary to clear the pupil
+        maxRadius=135,          # Accommodates max 125px iris limits
     )
     if circles is None:
-        return None
+        # Fallback heuristic: If sclera contrast is low, use an empirical spatial expansion
+        return [px, py, int(pr + 58)]
 
-    # Pick the circle whose center is closest to the pupil center
-    # and whose radius is larger than the pupil's
     circles = circles[0]
-    valid = [c for c in circles if c[2] > pr * 1.2]
+    # Filter candidates to enforce natural physiological ranges
+    valid = [c for c in circles if c[2] > pr + 20]
     if not valid:
-        return None
+        return [px, py, int(pr + 58)]
 
+    # Choose the circle concentric with the pupil center
     best = min(valid, key=lambda c: (c[0] - px)**2 + (c[1] - py)**2)
     return best  # (x, y, r)
 
@@ -172,6 +166,7 @@ def daugman_rubber_sheet(gray, pupil_xyr, iris_xyr, polar_h=64, polar_w=512):
     """
     Daugman's Rubber Sheet Model — unroll the iris annulus into a rectangular
     polar representation using bilinear interpolation.
+    Accelerated via PyTorch grid_sample on the Kaggle GPU.
 
     For each angle θ ∈ [0, 2π) and radial step r ∈ (0, 1]:
         x(r, θ) = (1-r) * pupil_x(θ) + r * iris_x(θ)
@@ -181,34 +176,30 @@ def daugman_rubber_sheet(gray, pupil_xyr, iris_xyr, polar_h=64, polar_w=512):
     px, py, pr = pupil_xyr
     ix, iy, ir = iris_xyr
 
-    # Angle array: polar_w points around the circle
-    theta = np.linspace(0, 2 * pi, polar_w, endpoint=False)
+    # Use GPU for preprocessing math to speed things up
+    theta = torch.linspace(0, 2 * pi, polar_w + 1, device=DEVICE)[:-1]
 
-    # Pupil boundary points
-    px_circle = px + pr * np.cos(theta)
-    py_circle = py + pr * np.sin(theta)
+    px_circle = px + pr * torch.cos(theta)
+    py_circle = py + pr * torch.sin(theta)
 
-    # Iris boundary points
-    ix_circle = ix + ir * np.cos(theta)
-    iy_circle = iy + ir * np.sin(theta)
+    ix_circle = ix + ir * torch.cos(theta)
+    iy_circle = iy + ir * torch.sin(theta)
 
-    # Radial steps: polar_h points from pupil to iris
-    radius = np.linspace(1 / polar_h, 1.0, polar_h).reshape(-1, 1)  # (polar_h, 1)
+    radius = torch.linspace(1 / polar_h, 1.0, polar_h, device=DEVICE).unsqueeze(1)
 
-    # Compute Cartesian coordinates for each (r, θ)
-    x_coords = (1 - radius) * px_circle + radius * ix_circle  # (polar_h, polar_w)
-    y_coords = (1 - radius) * py_circle + radius * iy_circle  # (polar_h, polar_w)
+    x_coords = (1 - radius) * px_circle + radius * ix_circle
+    y_coords = (1 - radius) * py_circle + radius * iy_circle
 
-    # Bilinear interpolation via cv2.remap
-    map_x = x_coords.astype(np.float32)
-    map_y = y_coords.astype(np.float32)
+    # Normalize Cartesian coordinates to [-1, 1] for grid_sample
+    x_norm = (x_coords / (w - 1)) * 2 - 1
+    y_norm = (y_coords / (h - 1)) * 2 - 1
+    grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0).float()
 
-    polar_img = cv2.remap(
-        gray, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE
-    )
-    return polar_img.astype(np.uint8)
+    # Interpolation on GPU
+    gray_tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0).to(DEVICE)
+    polar_img = F.grid_sample(gray_tensor, grid, mode='bilinear', padding_mode='border', align_corners=True)
+
+    return polar_img.squeeze().cpu().numpy().astype(np.uint8)
 
 
 # Track segmentation statistics
@@ -273,7 +264,13 @@ class IrisDataset(Dataset):
         self.std      = std
 
         print(f"Preloading {len(image_paths)} images (polar {polar_h}×{polar_w})...")
-        self.cache = [preprocess_iris_to_polar(p, polar_h, polar_w) for p in image_paths]
+        
+        # Parallelize CPU-bound HoughCircles preprocessing, while Daugman unrolling runs on GPU
+        from concurrent.futures import ThreadPoolExecutor
+        import os
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+            self.cache = list(executor.map(lambda p: preprocess_iris_to_polar(p, polar_h, polar_w), image_paths))
+            
         print(f"Preload complete — seg success: {_seg_stats['success']}, fail: {_seg_stats['fail']}")
 
     def __len__(self):
@@ -310,7 +307,7 @@ class IrisDataset(Dataset):
             img = cv2.GaussianBlur(img, (k, k), 0)
 
         # Horizontal band occlusion (simulates eyelid in polar space)
-        if random.random() > 0.5:
+        if random.random() > 0.8:  # Reduced probability from 0.5 to 0.2
             band_h = random.randint(h // 10, h // 4)
             if random.random() > 0.5:
                 img[:band_h, :] = 0  # top
@@ -466,6 +463,12 @@ class IrisResNet(nn.Module):
         self.layer3  = backbone.layer3   # 256 ch, 4×32 for 64×512 input
         self.layer4  = backbone.layer4   # 512 ch, 2×16 for 64×512 input
         self.avgpool = backbone.avgpool
+        
+        # Bottleneck Injection
+        self.dropout = nn.Dropout(p=CONFIG["dropout_rate"])
+        self.bottleneck = nn.Linear(512, 512, bias=False)
+        self.bn2 = nn.BatchNorm1d(512)
+        
         self.embedding_dim = 512
 
         if freeze_backbone:
@@ -486,6 +489,11 @@ class IrisResNet(nn.Module):
         l4_feat = x
         x = self.avgpool(x)
         x = x.flatten(1)
+        
+        x = self.dropout(x)
+        x = self.bottleneck(x)
+        x = self.bn2(x)
+        
         embeds = F.normalize(x, p=2, dim=1)
         return embeds, l3_feat, l4_feat
 
@@ -554,6 +562,13 @@ with torch.no_grad():
 
 # %% — Cell 11: Training Loop
 criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+# Initial Freeze: freeze all except bottleneck, bn2, and arcface head
+print("Freezing backbone for 5-epoch warmup...")
+for name, param in base_model.named_parameters():
+    if "bottleneck" not in name and "bn2" not in name:
+        param.requires_grad = False
+
 optimizer = optim.AdamW(
     [{"params": model.parameters()},
      {"params": arcface.parameters()}],
@@ -566,6 +581,13 @@ best_val_loss = float("inf")
 patience_ctr  = 0
 
 for epoch in range(CONFIG["epochs"]):
+    # 5-epoch backbone warmup logic
+    if epoch == 5:
+        print("Unfreezing backbone for end-to-end fine-tuning...")
+        for param in base_model.parameters():
+            param.requires_grad = True
+        # PyTorch optimizer automatically tracks these parameters since they 
+        # were passed during initialization. Gradients will now flow.
     # ── Train ──
     model.train(); arcface.train()
     run_loss, correct, total = 0.0, 0, 0
