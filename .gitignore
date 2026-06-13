@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Large model and export artifacts
+*.onnx
+*.engine
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*metadata.json
+*deployment_note.md
+
+# Runtime/demo data
+/iris_users*.json
+/uploads/
+/data/*.json
+
+# Local/OS noise
+.DS_Store
+Thumbs.db

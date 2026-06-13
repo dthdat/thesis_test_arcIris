@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_title }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="iris-mark" aria-hidden="true">
+          <span></span>
+        </div>
+        <div>
+          <h1>{{ app_title }}</h1>
+          <p>Jetson Nano local dashboard</p>
+        </div>
+      </div>
+      <div class="status-strip" aria-live="polite">
+        <div>
+          <span>Status</span>
+          <strong id="systemStatus">{{ initial_status }}</strong>
+        </div>
+        <div>
+          <span>Users</span>
+          <strong id="userCount">{{ initial_user_count }}</strong>
+        </div>
+        <div>
+          <span>Server</span>
+          <strong id="serverIp">{{ initial_server }}</strong>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="tab-button active" type="button" data-tab="recognition">Recognition</button>
+      <button class="tab-button" type="button" data-tab="enrollment">Enrollment / Training</button>
+      <button class="tab-button" type="button" data-tab="database">Database</button>
+      <button class="tab-button" type="button" data-tab="camera">Camera Later</button>
+    </nav>
+
+    <main>
+      <section id="recognition" class="panel active">
+        <div class="panel-grid recognition-grid">
+          <div class="surface">
+            <div class="section-title">
+              <h2>Recognition</h2>
+              <p>Upload one iris image for matching.</p>
+            </div>
+
+            <label id="queryDrop" class="drop-zone" for="queryInput">
+              <input id="queryInput" type="file" accept="image/*">
+              <img id="queryPreview" alt="Selected iris preview">
+              <span class="drop-empty">
+                <strong>Choose iris image</strong>
+                <small>Drop here or click to browse</small>
+              </span>
+            </label>
+
+            <div class="control-row">
+              <label class="check-row">
+                <input id="autoRecognize" type="checkbox">
+                <span>Auto-run recognition</span>
+              </label>
+            </div>
+
+            <div class="button-row">
+              <button id="recognizeBtn" class="primary-button" type="button" data-busy-disable>Run Recognition</button>
+              <button id="clearQueryBtn" class="secondary-button" type="button" data-busy-disable>Clear</button>
+            </div>
+          </div>
+
+          <aside class="decision-surface">
+            <div class="section-title">
+              <h2>Decision</h2>
+              <p>Best score across left and right enrolled eyes.</p>
+            </div>
+
+            <div class="decision-block">
+              <div id="decisionText" class="decision-text idle">READY</div>
+              <div id="decisionSub" class="decision-sub">Choose an image to begin.</div>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric-box">
+                <span>Identity</span>
+                <strong id="identityMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Matched Eye</span>
+                <strong id="eyeMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Similarity</span>
+                <strong id="scoreMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Time</span>
+                <strong id="timeMetric">-</strong>
+              </div>
+            </div>
+
+            <div class="threshold-line">
+              <label for="thresholdRange">Threshold</label>
+              <strong id="thresholdLabel">{{ default_threshold }}</strong>
+            </div>
+            <div class="threshold-control">
+              <input id="thresholdRange" type="range" min="0.10" max="0.95" step="0.01" value="{{ default_threshold }}">
+              <input id="thresholdText" class="text-input threshold-input" type="text" value="{{ default_threshold }}">
+            </div>
+
+            <pre id="scoreLog" class="score-log">Top matches will appear here.</pre>
+          </aside>
+        </div>
+      </section>
+
+      <section id="enrollment" class="panel">
+        <div class="panel-grid enrollment-grid">
+          <div class="surface">
+            <div class="section-title">
+              <h2>Enrollment / Training</h2>
+              <p>Store a person with one left-eye and one right-eye embedding.</p>
+            </div>
+
+            <label class="field-label" for="enrollName">User name</label>
+            <input id="enrollName" class="text-input" type="text" placeholder="Example: Dat" autocomplete="off">
+
+            <div class="eye-grid">
+              <div>
+                <h3>Left Eye</h3>
+                <label id="leftDrop" class="drop-zone small" for="leftInput">
+                  <input id="leftInput" type="file" accept="image/*">
+                  <img id="leftPreview" alt="Left eye preview">
+                  <span class="drop-empty">
+                    <strong>Choose left eye</strong>
+                    <small>Preview appears here</small>
+                  </span>
+                </label>
+              </div>
+
+              <div>
+                <h3>Right Eye</h3>
+                <label id="rightDrop" class="drop-zone small" for="rightInput">
+                  <input id="rightInput" type="file" accept="image/*">
+                  <img id="rightPreview" alt="Right eye preview">
+                  <span class="drop-empty">
+                    <strong>Choose right eye</strong>
+                    <small>Preview appears here</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button id="registerBtn" class="primary-button" type="button" data-busy-disable>Enroll User</button>
+              <button id="clearEnrollBtn" class="secondary-button" type="button" data-busy-disable>Clear</button>
+            </div>
+          </div>
+
+          <aside class="decision-surface">
+            <div class="section-title">
+              <h2>Enrollment Result</h2>
+              <p>Both embeddings must be valid before storage.</p>
+            </div>
+
+            <div class="decision-block">
+              <div id="enrollDecision" class="decision-text idle">WAITING</div>
+              <div id="enrollSub" class="decision-sub">Enter a name and choose both eyes.</div>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric-box">
+                <span>Left Eye</span>
+                <strong id="leftTimeMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Right Eye</span>
+                <strong id="rightTimeMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Total Time</span>
+                <strong id="enrollTimeMetric">-</strong>
+              </div>
+              <div class="metric-box">
+                <span>Database</span>
+                <strong id="enrollDbMetric">-</strong>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="database" class="panel">
+        <div class="surface full">
+          <div class="database-head">
+            <div class="section-title">
+              <h2>Database</h2>
+              <p>Local JSON enrollment records on the Jetson.</p>
+            </div>
+            <div class="button-row compact">
+              <button id="refreshDbBtn" class="secondary-button" type="button" data-busy-disable>Refresh</button>
+              <button id="deleteDbBtn" class="danger-button" type="button" data-busy-disable>Delete All</button>
+            </div>
+          </div>
+          <div id="usersGrid" class="users-grid" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="camera" class="panel">
+        <div class="surface full">
+          <div class="section-title">
+            <h2>Camera Later</h2>
+            <p>The upload backend is ready for a camera capture pipeline later.</p>
+          </div>
+          <ol class="pipeline-list">
+            <li>Capture face image</li>
+            <li>Detect left and right eyes</li>
+            <li>Crop iris regions</li>
+            <li>Run this same backend</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="loader" class="loader" aria-live="assertive" aria-hidden="true">
+    <div class="loader-box">
+      <div class="spinner" aria-hidden="true"></div>
+      <strong id="loaderText">Processing...</strong>
+      <span>Jetson is running segmentation and TensorRT inference.</span>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    window.IRIS_CONFIG = {
+      defaultThreshold: "{{ default_threshold }}",
+      serverPort: {{ server_port }}
+    };
+  </script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
